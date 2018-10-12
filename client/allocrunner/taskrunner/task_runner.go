@@ -44,10 +44,11 @@ const (
 )
 
 type TaskRunner struct {
-	// allocID and taskName are immutable so these fields may be accessed
-	// without locks
-	allocID  string
-	taskName string
+	// allocID, taskName, and taskLeader are immutable so these fields may
+	// be accessed without locks
+	allocID    string
+	taskName   string
+	taskLeader bool
 
 	alloc     *structs.Allocation
 	allocLock sync.Mutex
@@ -184,6 +185,7 @@ func NewTaskRunner(config *Config) (*TaskRunner, error) {
 		task:            config.Task,
 		taskDir:         config.TaskDir,
 		taskName:        config.Task.Name,
+		taskLeader:      config.Task.Leader,
 		envBuilder:      envBuilder,
 		consulClient:    config.Consul,
 		vaultClient:     config.VaultClient,
@@ -355,15 +357,6 @@ func (tr *TaskRunner) handleUpdates() {
 			return
 		}
 
-		if tr.Alloc().TerminalStatus() {
-			// Terminal update: kill TaskRunner and let Run execute postrun hooks
-			err := tr.Kill(context.TODO(), structs.NewTaskEvent(structs.TaskKilled))
-			if err != nil {
-				tr.logger.Warn("error stopping task", "error", err)
-			}
-			continue
-		}
-
 		// Non-terminal update; run hooks
 		tr.updateHooks()
 	}
@@ -511,6 +504,7 @@ func (tr *TaskRunner) Restore() error {
 // update.
 func (tr *TaskRunner) UpdateState(state string, event *structs.TaskEvent) {
 	tr.logger.Debug("setting task state", "state", state, "event", event.Type)
+
 	// Update the local state
 	stateCopy := tr.setStateLocal(state, event)
 
@@ -591,7 +585,6 @@ func (tr *TaskRunner) setStateLocal(state string, event *structs.TaskEvent) *str
 // logged. Use AppendEvent to simply add a new event.
 func (tr *TaskRunner) EmitEvent(event *structs.TaskEvent) {
 	tr.stateLock.Lock()
-	defer tr.stateLock.Unlock()
 
 	tr.appendEvent(event)
 
@@ -601,8 +594,11 @@ func (tr *TaskRunner) EmitEvent(event *structs.TaskEvent) {
 		tr.logger.Warn("error persisting event", "error", err, "event", event)
 	}
 
+	stateCopy := tr.state.Copy()
+	tr.stateLock.Unlock()
+
 	// Notify the alloc runner of the event
-	tr.stateUpdater.TaskStateUpdated(tr.taskName, tr.state.Copy())
+	tr.stateUpdater.TaskStateUpdated(tr.taskName, stateCopy)
 }
 
 // AppendEvent appends a new TaskEvent to this task's TaskState. The actual
