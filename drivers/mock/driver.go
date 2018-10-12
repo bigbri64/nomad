@@ -22,7 +22,7 @@ const (
 	pluginName = "mock"
 
 	// fingerprintPeriod is the interval at which the driver will send fingerprint responses
-	fingerprintPeriod = 30 * time.Second
+	fingerprintPeriod = 500 * time.Millisecond
 )
 
 var (
@@ -66,7 +66,7 @@ var (
 	// capabilities is returned by the Capabilities RPC and indicates what
 	// optional features this driver supports
 	capabilities = &drivers.Capabilities{
-		SendSignals: true,
+		SendSignals: false,
 		Exec:        true,
 		FSIsolation: cstructs.FSIsolationNone,
 	}
@@ -245,7 +245,8 @@ func (d *Driver) buildFingerprint() *drivers.Fingerprint {
 }
 
 func (d *Driver) RecoverTask(*drivers.TaskHandle) error {
-	panic("not implemented")
+	//TODO is there anything to do here?
+	return nil
 }
 
 func (d *Driver) StartTask(cfg *drivers.TaskConfig) (*drivers.TaskHandle, *cstructs.DriverNetwork, error) {
@@ -279,6 +280,8 @@ func (d *Driver) StartTask(cfg *drivers.TaskConfig) (*drivers.TaskHandle, *cstru
 		net.PortMap = map[string]int{parts[0]: port}
 	}
 
+	killCtx, killCancel := context.WithCancel(context.Background())
+
 	h := &mockTaskHandle{
 		task:            cfg,
 		runFor:          driverConfig.RunFor,
@@ -288,8 +291,10 @@ func (d *Driver) StartTask(cfg *drivers.TaskConfig) (*drivers.TaskHandle, *cstru
 		stdoutString:    driverConfig.StdoutString,
 		stdoutRepeat:    driverConfig.StdoutRepeat,
 		stdoutRepeatDur: driverConfig.StdoutRepeatDur,
-		logger:          d.logger,
-		doneCh:          make(chan struct{}),
+		logger:          d.logger.With("task_name", cfg.Name),
+		waitCh:          make(chan struct{}),
+		killCh:          killCtx.Done(),
+		kill:            killCancel,
 	}
 	if driverConfig.ExitErrMsg != "" {
 		h.exitErr = errors.New(driverConfig.ExitErrMsg)
@@ -337,16 +342,39 @@ func (d *Driver) handleWait(ctx context.Context, handle *mockTaskHandle, ch chan
 		return
 	case <-d.ctx.Done():
 		return
-	case <-handle.doneCh:
+	case <-handle.waitCh:
 		ch <- handle.exitResult
 	}
 }
 func (d *Driver) StopTask(taskID string, timeout time.Duration, signal string) error {
-	panic("not implemented")
+	h, ok := d.tasks.Get(taskID)
+	if !ok {
+		return drivers.ErrTaskNotFound
+	}
+
+	d.logger.Debug("killing task",
+		"task_name", h.task.Name,
+		"kill_after", h.killAfter,
+		"kill_timeout", h.killTimeout,
+	)
+
+	select {
+	case <-h.waitCh:
+		d.logger.Debug("not killing task: already exited", "task_name", h.task.Name)
+	case <-time.After(h.killAfter):
+		d.logger.Debug("killing task due to kill_after", "task_name", h.task.Name)
+		h.kill()
+	case <-time.After(h.killTimeout):
+		d.logger.Debug("killing task after kill_timeout", "task_name", h.task.Name)
+		h.kill()
+	}
+	return nil
 }
 
 func (d *Driver) DestroyTask(taskID string, force bool) error {
-	panic("not implemented")
+	//TODO is there anything else to do here?
+	d.tasks.Delete(taskID)
+	return nil
 }
 
 func (d *Driver) InspectTask(taskID string) (*drivers.TaskStatus, error) {
@@ -354,7 +382,8 @@ func (d *Driver) InspectTask(taskID string) (*drivers.TaskStatus, error) {
 }
 
 func (d *Driver) TaskStats(taskID string) (*cstructs.TaskResourceUsage, error) {
-	panic("not implemented")
+	//TODO return an error?
+	return nil, nil
 }
 
 func (d *Driver) TaskEvents(context.Context) (<-chan *drivers.TaskEvent, error) {
@@ -362,9 +391,23 @@ func (d *Driver) TaskEvents(context.Context) (<-chan *drivers.TaskEvent, error) 
 }
 
 func (d *Driver) SignalTask(taskID string, signal string) error {
-	panic("not implemented")
+	h, ok := d.tasks.Get(taskID)
+	if !ok {
+		return drivers.ErrTaskNotFound
+	}
+
+	return h.signalErr
 }
 
 func (d *Driver) ExecTask(taskID string, cmd []string, timeout time.Duration) (*drivers.ExecTaskResult, error) {
-	panic("not implemented")
+	h, ok := d.tasks.Get(taskID)
+	if !ok {
+		return nil, drivers.ErrTaskNotFound
+	}
+
+	res := drivers.ExecTaskResult{
+		Stdout:     []byte(fmt.Sprintf("Exec(%q, %q)", h.task.Name, cmd)),
+		ExitResult: &drivers.ExitResult{},
+	}
+	return &res, nil
 }
